@@ -45,13 +45,11 @@ class DoConfig(nanodo_model.DoConfig):
   # QKV depth-gate: True => relu(logit + learnable bias) (sum-init);
   # False => softmax over depth slots, no bias (mean-init).
   dca_grn_bias: bool = True
-  # DCA GRN hard source selection. "all" keeps current behavior. "topk" keeps
-  # exactly `dca_grn_topk` source slots per token/head; "top_pct" keeps
-  # ceil(K * dca_grn_top_pct). Bias-gated selectors rank layers after forming
-  # relu(logit + bias), then apply the same layer mask to the full coefficient.
-  dca_grn_select: str = "all"  # one of {"all", "topk", "top_pct"}
-  dca_grn_topk: int = 0
-  dca_grn_top_pct: float = 0.0
+  # DCA GRN hard source selection. 0 keeps current behavior; integer k>=1
+  # keeps exactly k source slots per token/head; 0<x<1 keeps ceil(K*x) slots.
+  # Bias-gated selectors rank layers after forming relu(logit + bias), then
+  # apply the same layer mask to the full coefficient.
+  dca_grn_topk: float = 0.0
 
 
 class MlpBlock(nn.Module):
@@ -138,18 +136,16 @@ class EncoderDecoder1DBlock(nn.Module):
 
 def _resolve_grn_keep_k(cfg, num_inputs: int) -> int:
   """Number of depth slots to keep for dynamic GRN hard selection."""
-  mode = cfg.dca_grn_select
-  if mode == "all":
+  topk = float(cfg.dca_grn_topk)
+  if topk == 0.0:
     return num_inputs
-  if mode == "topk":
-    assert cfg.dca_grn_topk > 0, "dca_grn_topk must be > 0 for topk"
-    return min(int(cfg.dca_grn_topk), num_inputs)
-  if mode == "top_pct":
-    assert 0.0 < cfg.dca_grn_top_pct <= 1.0, (
-        "dca_grn_top_pct must be in (0, 1] for top_pct"
-    )
-    return max(1, min(math.ceil(num_inputs * cfg.dca_grn_top_pct), num_inputs))
-  raise NotImplementedError(f"unknown dca_grn_select: {mode!r}")
+  assert topk > 0.0, "dca_grn_topk must be non-negative"
+  if topk < 1.0:
+    return max(1, min(math.ceil(num_inputs * topk), num_inputs))
+  assert topk.is_integer(), (
+      "dca_grn_topk >= 1 must be an integer; use 0<x<1 for percentage"
+  )
+  return min(int(topk), num_inputs)
 
 
 def _exact_topk_mask(scores: jax.Array, k: int, axis: int) -> jax.Array:
