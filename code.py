@@ -40,6 +40,7 @@ class RdmConfig(model.DoConfig):
   # Depth backend.
   rdm_backend: str = "dca"  # {"dca", "hc", "attnres"}
   rdm_mix_mode: str = "hidden"  # {"hidden", "qkv", "qkvr"}
+  rdm_block_style: str = "transformer"  # {"transformer", "dca"}
   rdm_source_state: str = "hidden"  # {"hidden", "delta", "ln_hidden", "ln_delta"}
   rdm_include_immediate_prev: bool = True
   rdm_include_embedding: bool = True
@@ -128,6 +129,22 @@ def _validate_cfg(cfg: RdmConfig):
         f"rdm_reader_type={cfg.rdm_reader_type!r}; only 'grn_v3' is implemented")
   if cfg.rdm_mix_mode not in ("hidden", "qkv", "qkvr"):
     raise ValueError(f"unknown rdm_mix_mode {cfg.rdm_mix_mode!r}")
+  if cfg.rdm_block_style not in ("transformer", "dca"):
+    raise ValueError(f"unknown rdm_block_style {cfg.rdm_block_style!r}")
+  if cfg.rdm_block_style == "dca":
+    if cfg.rdm_backend != "dca" or cfg.rdm_mix_mode != "qkv":
+      raise NotImplementedError(
+          "rdm_block_style='dca' requires rdm_backend='dca' and "
+          "rdm_mix_mode='qkv'")
+    if cfg.rdm_source_state != "hidden":
+      raise NotImplementedError(
+          "rdm_block_style='dca' requires rdm_source_state='hidden'")
+    if not cfg.rdm_include_embedding:
+      raise NotImplementedError(
+          "rdm_block_style='dca' requires rdm_include_embedding=True")
+    if cfg.rdm_headwise_kv_heads != -1:
+      raise NotImplementedError(
+          "rdm_block_style='dca' currently requires all KV heads to use memory")
   if cfg.rdm_source_state not in ("hidden", "delta", "ln_hidden", "ln_delta"):
     raise ValueError(f"unknown rdm_source_state {cfg.rdm_source_state!r}")
   if cfg.rdm_writer_version not in ("simple", "targeted"):
@@ -255,6 +272,8 @@ def _init_edge_mode(cfg: RdmConfig) -> str:
     return cfg.rdm_init_mode
   if cfg.rdm_backend == "hc":
     return "closed"
+  if cfg.rdm_backend == "dca" and cfg.rdm_block_style == "dca":
+    return "dense"
   if cfg.rdm_backend == "dca" and cfg.rdm_source_state == "delta":
     return "dense"
   return "immediate"
@@ -550,6 +569,11 @@ class MultiInputBlock(nn.Module):
         current_k,
         current_v,
     )
+    if cfg.rdm_block_style == "dca":
+      pre_ff = nn.LayerNorm(dtype=cfg.dtype, use_bias=False, name="ln_ff")(
+          xq + attn)
+      z = model.Mlp(cfg, name="mlp")(pre_ff)
+      return attn + z
     x = xr + attn
     z = model.Mlp(cfg, name="mlp")(
         nn.LayerNorm(dtype=cfg.dtype, use_bias=False, name="ln_ff")(x)
@@ -971,7 +995,7 @@ class RdmTransformerDo(nn.Module):
         xr = h
       h_next = MultiInputBlock(cfg, name=f"block_{lyr}")(
           xq, xk, xv, xr, positions, current=h)
-      delta = h_next - h
+      delta = h_next if cfg.rdm_block_style == "dca" else h_next - h
 
       if lyr + 1 < cfg.N:
         messages.append(self._source_message(h_next, h, delta, lyr))
