@@ -642,6 +642,11 @@ class RoutedWriter(nn.Module):
   def __call__(self, source_BxLxD, aux_BxLxD=None):
     cfg = self.cfg
     C = _stream_count(cfg)
+    if source_BxLxD is None:
+      raise ValueError(
+          "RoutedWriter received source=None. This means the selected "
+          "rdm_source_state is not available at the point where the writer was "
+          "called; delta/ln_delta sources must route after the block.")
     B, L, _ = source_BxLxD.shape
     if aux_BxLxD is None:
       aux_BxLxD = source_BxLxD
@@ -1144,7 +1149,6 @@ class RdmTransformerDo(nn.Module):
             h_next = _gate_transformer_output(
                 raw_next, xr, current_gate, identity_gate)
           delta = h_next if cfg.rdm_block_style == "dca" else h_next - h
-          source_message = self._source_message(h, h_next, delta, lyr)
 
       if lyr + 1 < cfg.N:
         messages.append(source_message)
@@ -1253,8 +1257,6 @@ class RdmTransformerDo(nn.Module):
         streams = gate_i * base_streams + gate_c * (streams - base_streams)
         h_next = streams.mean(axis=2)
         delta = h_next - prev_hidden
-        if not preblock_writer:
-          source_message = self._source_message(prev_hidden, h_next, delta, lyr)
       elif source_message is None:
         source_message = self._source_message(prev_hidden, h_next, delta, lyr)
 
@@ -1331,7 +1333,6 @@ class RdmTransformerDo(nn.Module):
           h_next = _gate_transformer_output(
               raw_next, xr, current_gate, identity_gate)
           delta = h_next - h
-          source_message = self._source_message(h, h_next, delta, lyr)
 
       if lyr + 1 < cfg.N:
         messages.append(source_message)
