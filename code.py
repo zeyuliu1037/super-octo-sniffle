@@ -41,9 +41,12 @@ class RdmConfig(model.DoConfig):
   rdm_backend: str = "dca"  # {"dca", "hc", "attnres"}
   rdm_mix_mode: str = "hidden"  # {"hidden", "qkv", "qkvr"}
   rdm_block_style: str = "transformer"  # {"transformer", "dca"}
-  rdm_source_state: str = "hidden"  # {"hidden", "delta", "ln_hidden", "ln_delta"}
+  rdm_source_state: str = "hidden"  # {"raw_cur", "hidden", "delta", "ln_*"}
   rdm_include_immediate_prev: bool = True
   rdm_include_embedding: bool = True
+  # Append an identity path after the N layer targets. When enabled, target
+  # layer i is also valid and gates the current block contribution.
+  rdm_include_identity_path: bool = False
   # Number of first K/V attention heads that use routed depth memory in qkv/qkvr.
   # -1 => all heads; 0 => K/V fully use the current layer input.
   rdm_headwise_kv_heads: int = -1
@@ -121,6 +124,20 @@ def _stream_count(cfg: RdmConfig) -> int:
   raise ValueError(f"unknown rdm_writer_streams {cfg.rdm_writer_streams!r}")
 
 
+def _writer_target_count(cfg: RdmConfig) -> int:
+  return cfg.N + int(cfg.rdm_include_identity_path)
+
+
+def _identity_target_index(cfg: RdmConfig) -> int:
+  return cfg.N
+
+
+def _source_state_base(cfg: RdmConfig) -> str:
+  if cfg.rdm_source_state.startswith("ln_"):
+    return cfg.rdm_source_state[3:]
+  return cfg.rdm_source_state
+
+
 def _validate_cfg(cfg: RdmConfig):
   if cfg.rdm_backend not in ("dca", "hc", "attnres"):
     raise ValueError(f"unknown rdm_backend {cfg.rdm_backend!r}")
@@ -145,7 +162,8 @@ def _validate_cfg(cfg: RdmConfig):
     if cfg.rdm_headwise_kv_heads != -1:
       raise NotImplementedError(
           "rdm_block_style='dca' currently requires all KV heads to use memory")
-  if cfg.rdm_source_state not in ("hidden", "delta", "ln_hidden", "ln_delta"):
+  if cfg.rdm_source_state not in (
+      "raw_cur", "hidden", "delta", "ln_raw_cur", "ln_hidden", "ln_delta"):
     raise ValueError(f"unknown rdm_source_state {cfg.rdm_source_state!r}")
   if cfg.rdm_writer_version not in ("simple", "targeted"):
     raise ValueError(f"unknown rdm_writer_version {cfg.rdm_writer_version!r}")
@@ -176,9 +194,10 @@ def _validate_cfg(cfg: RdmConfig):
       raise NotImplementedError(
           "rdm_init_mode='safe' for attnres requires rdm_source_state='hidden'")
     if cfg.rdm_backend == "dca" and cfg.rdm_source_state not in (
-        "hidden", "delta"):
+        "raw_cur", "hidden", "delta"):
       raise NotImplementedError(
-          "rdm_init_mode='safe' for dca supports hidden or delta source states")
+          "rdm_init_mode='safe' for dca supports raw_cur, hidden, or "
+          "delta source states")
     if (cfg.rdm_backend == "dca" and cfg.rdm_source_state == "delta"
         and not cfg.rdm_include_embedding):
       raise NotImplementedError(
@@ -265,6 +284,19 @@ def _merge_head_prefix(memory_BxLxHxDh, current_BxLxHxDh, num_memory_heads: int)
       memory_BxLxHxDh[:, :, :num_memory_heads, :],
       current_BxLxHxDh[:, :, num_memory_heads:, :],
   ], axis=-2)
+
+
+def _path_score_to_gate(score_BxLxC):
+  return jnp.mean(score_BxLxC.astype(jnp.float32), axis=-1, keepdims=True)
+
+
+def _gate_transformer_output(raw_next_BxLxD, block_base_BxLxD,
+                             current_gate_BxLx1, identity_gate_BxLx1):
+  delta = raw_next_BxLxD - block_base_BxLxD
+  return (
+      identity_gate_BxLx1.astype(raw_next_BxLxD.dtype) * block_base_BxLxD
+      + current_gate_BxLx1.astype(raw_next_BxLxD.dtype) * delta
+  )
 
 
 def _init_edge_mode(cfg: RdmConfig) -> str:
@@ -582,7 +614,7 @@ class MultiInputBlock(nn.Module):
 
 
 class RoutedWriter(nn.Module):
-  """Scheduled source-to-future-target writer."""
+  """Scheduled source-to-target writer with an optional identity path."""
 
   cfg: RdmConfig
   layer_index: int
@@ -592,6 +624,7 @@ class RoutedWriter(nn.Module):
     cfg = self.cfg
     mode = _init_edge_mode(cfg)
     init = jnp.full(shape, cfg.rdm_init_closed_logit, dtype=dtype)
+    target_count = shape[-1]
     if mode == "dense":
       init = jnp.full(shape, cfg.rdm_init_open_logit, dtype=dtype)
     elif mode == "immediate":
@@ -600,18 +633,23 @@ class RoutedWriter(nn.Module):
         init = init.at[:, immediate].set(cfg.rdm_init_open_logit)
     elif mode != "closed":
       raise ValueError(f"unknown resolved init edge mode {mode!r}")
+    if cfg.rdm_include_identity_path and cfg.rdm_init_mode == "safe":
+      init = init.at[:, self.layer_index].set(cfg.rdm_init_open_logit)
+      init = init.at[:, target_count - 1].set(cfg.rdm_init_open_logit)
     return init
 
   @nn.compact
-  def __call__(self, hidden_BxLxD, delta_BxLxD):
+  def __call__(self, source_BxLxD, aux_BxLxD=None):
     cfg = self.cfg
     C = _stream_count(cfg)
-    B, L, _ = hidden_BxLxD.shape
+    B, L, _ = source_BxLxD.shape
+    if aux_BxLxD is None:
+      aux_BxLxD = source_BxLxD
     features = jnp.concatenate([
         nn.LayerNorm(dtype=cfg.dtype, use_bias=False, name="hidden_ln")(
-            hidden_BxLxD),
+            source_BxLxD),
         nn.LayerNorm(dtype=cfg.dtype, use_bias=False, name="delta_ln")(
-            delta_BxLxD),
+            aux_BxLxD),
     ], axis=-1)
 
     if cfg.router_type == "mlp":
@@ -628,8 +666,9 @@ class RoutedWriter(nn.Module):
         name="router_out" if cfg.router_type == "mlp" else "router",
     )(features).astype(jnp.float32)
 
+    target_count = _writer_target_count(cfg)
     if cfg.rdm_writer_version == "simple":
-      logits = jnp.broadcast_to(source_logits[..., None], (B, L, C, cfg.N))
+      logits = jnp.broadcast_to(source_logits[..., None], (B, L, C, target_count))
     elif cfg.rdm_writer_version == "targeted":
       rank = cfg.rdm_writer_rank
       source_proj = nn.Dense(
@@ -639,19 +678,33 @@ class RoutedWriter(nn.Module):
       target_emb = self.param(
           "target_emb",
           nn.initializers.normal(stddev=0.02),
-          (cfg.N, C, rank),
+          (target_count, C, rank),
       ).astype(jnp.float32)
       compat = jnp.einsum("blcr,ncr->blcn", source_proj, target_emb)
-      offset = self.param("target_bias", self._offset_init, (C, cfg.N))
+      offset = self.param("target_bias", self._offset_init, (C, target_count))
       logits = source_logits[..., None] + compat + offset[None, None, :, :]
     else:
       raise ValueError(f"unknown rdm_writer_version {cfg.rdm_writer_version!r}")
 
-    valid = (jnp.arange(cfg.N) > self.layer_index).reshape(1, 1, 1, cfg.N)
+    if cfg.rdm_include_identity_path:
+      layer_valid = jnp.arange(cfg.N) >= self.layer_index
+      identity_valid = jnp.ones((1,), dtype=jnp.bool_)
+      valid_vec = jnp.concatenate([layer_valid, identity_valid], axis=0)
+    else:
+      valid_vec = jnp.arange(cfg.N) > self.layer_index
+    valid = valid_vec.reshape(1, 1, 1, target_count)
     logits = jnp.where(valid, logits, jnp.finfo(jnp.float32).min)
     probs = jax.nn.sigmoid(logits / cfg.rdm_temperature).astype(cfg.dtype)
     probs = jnp.where(valid, probs, jnp.zeros_like(probs))
-    probs = _apply_source_hardening(cfg, probs, valid)
+    if cfg.rdm_include_identity_path:
+      future_valid = (jnp.arange(cfg.N) > self.layer_index).reshape(
+          1, 1, 1, cfg.N)
+      hardened_targets = _apply_source_hardening(
+          cfg, probs[..., :cfg.N], future_valid)
+      targets = jnp.where(future_valid, hardened_targets, probs[..., :cfg.N])
+      probs = jnp.concatenate([targets, probs[..., cfg.N:]], axis=-1)
+    else:
+      probs = _apply_source_hardening(cfg, probs, valid)
 
     if cfg.rdm_z_weight > 0.0:
       valid_logits = jnp.where(valid, logits, jnp.finfo(jnp.float32).min)
@@ -798,6 +851,31 @@ class RdmTransformerDo(nn.Module):
 
   def _sow_writer_metrics(self, edge_row_BxLxCxN, layer_index: int):
     cfg = self.docfg
+    if cfg.rdm_include_identity_path:
+      weight_path = 1.0 / max(cfg.N, 1)
+      current = edge_row_BxLxCxN[..., layer_index].astype(jnp.float32)
+      identity = edge_row_BxLxCxN[
+          ..., _identity_target_index(cfg)].astype(jnp.float32)
+      self._sow_intermediate(
+          "rdm_current_path_mean", weight_path * jnp.mean(current))
+      self._sow_intermediate(
+          "rdm_identity_path_mean", weight_path * jnp.mean(identity))
+      self._sow_intermediate(
+          "rdm_current_path_ge_threshold",
+          weight_path * jnp.mean((current >= cfg.rdm_threshold).astype(jnp.float32)),
+      )
+      self._sow_intermediate(
+          "rdm_identity_path_ge_threshold",
+          weight_path * jnp.mean((identity >= cfg.rdm_threshold).astype(jnp.float32)),
+      )
+      self._sow_intermediate(
+          "rdm_path_score_mean",
+          weight_path * jnp.mean(edge_row_BxLxCxN.astype(jnp.float32)),
+      )
+      edge_row_BxLxCxN = edge_row_BxLxCxN[..., :cfg.N]
+      if layer_index + 1 >= cfg.N:
+        return
+
     weight = 1.0 / max(cfg.N - 1, 1)
     valid = (jnp.arange(cfg.N) > layer_index).reshape(1, 1, 1, cfg.N)
     long_range = (jnp.arange(cfg.N) > layer_index + 1).reshape(1, 1, 1, cfg.N)
@@ -836,17 +914,21 @@ class RdmTransformerDo(nn.Module):
       self._sow_intermediate("rdm_writer_stream_entropy", weight * entropy)
 
   def _initial_embedding_edges(self, cfg, B, L, C):
+    target_count = _writer_target_count(cfg)
     if not cfg.rdm_writer_enabled:
-      return jnp.ones((B, L, C, cfg.N), dtype=cfg.dtype)
+      return jnp.ones((B, L, C, target_count), dtype=cfg.dtype)
     mode = _init_edge_mode(cfg)
     if cfg.rdm_writer_edge_apply == "mask_only":
       row = jnp.zeros((B, L, C, cfg.N), dtype=cfg.dtype)
       if mode == "dense":
-        return jnp.ones((B, L, C, cfg.N), dtype=cfg.dtype)
-      if mode == "immediate" and cfg.N > 0:
+        row = jnp.ones((B, L, C, cfg.N), dtype=cfg.dtype)
+      elif mode == "immediate" and cfg.N > 0:
         row = row.at[:, :, :, 0].set(jnp.ones((), dtype=cfg.dtype))
       elif mode != "closed":
         raise ValueError(f"unknown resolved init edge mode {mode!r}")
+      if cfg.rdm_include_identity_path:
+        identity = jnp.zeros((B, L, C, 1), dtype=cfg.dtype)
+        row = jnp.concatenate([row, identity], axis=-1)
       return row
     closed = jax.nn.sigmoid(
         jnp.asarray(cfg.rdm_init_closed_logit / cfg.rdm_temperature,
@@ -861,6 +943,9 @@ class RdmTransformerDo(nn.Module):
       row = row.at[:, :, :, 0].set(open_.astype(cfg.dtype))
     elif mode != "closed":
       raise ValueError(f"unknown resolved init edge mode {mode!r}")
+    if cfg.rdm_include_identity_path:
+      identity = jnp.full((B, L, C, 1), closed, dtype=cfg.dtype)
+      row = jnp.concatenate([row, identity], axis=-1)
     return row
 
   def _sow_align(self, alpha0_BxLxK, edges_BxLxK):
@@ -895,28 +980,46 @@ class RdmTransformerDo(nn.Module):
     self._sow_reader_metrics(alpha0, edges_BxLxK)
     return y
 
-  def _source_message(self, h_next, h_prev, delta, layer_index):
+  def _source_message(self, raw_cur, hidden, delta, layer_index):
     cfg = self.docfg
-    if cfg.rdm_source_state == "hidden":
-      return h_next
-    if cfg.rdm_source_state == "delta":
+    state = cfg.rdm_source_state
+    if state == "raw_cur":
+      return raw_cur
+    if state == "hidden":
+      return hidden
+    if state == "delta":
       return delta
-    if cfg.rdm_source_state == "ln_hidden":
+    if state == "ln_raw_cur":
+      return nn.LayerNorm(
+          dtype=cfg.dtype, use_bias=False,
+          name=f"write_ln_raw_cur_{layer_index}")(raw_cur)
+    if state == "ln_hidden":
       return nn.LayerNorm(
           dtype=cfg.dtype, use_bias=False, name=f"write_ln_hidden_{layer_index}")(
-              h_next)
-    del h_prev
+              hidden)
     return nn.LayerNorm(
         dtype=cfg.dtype, use_bias=False, name=f"write_ln_delta_{layer_index}")(
             delta)
 
-  def _append_writer_row(self, edge_rows, h_next, delta, layer_index, B, L, C):
+  def _path_gates(self, edge_row_BxLxCxT, layer_index):
     cfg = self.docfg
-    if cfg.rdm_writer_enabled:
+    if not cfg.rdm_include_identity_path:
+      B, L = edge_row_BxLxCxT.shape[:2]
+      ones = jnp.ones((B, L, 1), dtype=cfg.dtype)
+      return ones, ones
+    current = _path_score_to_gate(edge_row_BxLxCxT[..., layer_index])
+    identity = _path_score_to_gate(
+        edge_row_BxLxCxT[..., _identity_target_index(cfg)])
+    return current.astype(cfg.dtype), identity.astype(cfg.dtype)
+
+  def _append_writer_row(self, edge_rows, source, layer_index, B, L, C,
+                         edge_row=None):
+    cfg = self.docfg
+    if edge_row is None and cfg.rdm_writer_enabled:
       edge_row = RoutedWriter(cfg, layer_index=layer_index,
-                              name=f"writer_{layer_index}")(h_next, delta)
-    else:
-      edge_row = jnp.ones((B, L, C, cfg.N), dtype=cfg.dtype)
+                              name=f"writer_{layer_index}")(source)
+    elif edge_row is None:
+      edge_row = jnp.ones((B, L, C, _writer_target_count(cfg)), dtype=cfg.dtype)
     self._sow_writer_metrics(edge_row, layer_index)
     return edge_rows + [edge_row]
 
@@ -993,14 +1096,60 @@ class RdmTransformerDo(nn.Module):
       xq, xk, xv, xr = self._call_depth_reader(lyr, stack, edges, "dca")
       if xr is None:
         xr = h
-      h_next = MultiInputBlock(cfg, name=f"block_{lyr}")(
+      route_hidden = xq if cfg.rdm_mix_mode in ("hidden", "qkv") else xr
+      source_base = _source_state_base(cfg)
+      preblock_writer = (
+          cfg.rdm_include_identity_path and source_base in ("raw_cur", "hidden"))
+      edge_row = None
+      current_gate = jnp.ones((B, L, 1), dtype=cfg.dtype)
+      identity_gate = jnp.ones((B, L, 1), dtype=cfg.dtype)
+      source_message = None
+      if preblock_writer:
+        source_message = self._source_message(h, route_hidden, None, lyr)
+        if cfg.rdm_writer_enabled:
+          edge_row = RoutedWriter(cfg, layer_index=lyr,
+                                  name=f"writer_{lyr}")(source_message)
+        else:
+          edge_row = jnp.ones((B, L, C, _writer_target_count(cfg)),
+                              dtype=cfg.dtype)
+        self._sow_writer_metrics(edge_row, lyr)
+        current_gate, identity_gate = self._path_gates(edge_row, lyr)
+
+      raw_next = MultiInputBlock(cfg, name=f"block_{lyr}")(
           xq, xk, xv, xr, positions, current=h)
+      if cfg.rdm_include_identity_path:
+        if cfg.rdm_block_style == "dca":
+          h_next = current_gate.astype(raw_next.dtype) * raw_next
+        else:
+          h_next = _gate_transformer_output(
+              raw_next, xr, current_gate, identity_gate)
+      else:
+        h_next = raw_next
       delta = h_next if cfg.rdm_block_style == "dca" else h_next - h
 
+      if not preblock_writer:
+        source_message = self._source_message(h, h_next, delta, lyr)
+        if cfg.rdm_include_identity_path:
+          if cfg.rdm_writer_enabled:
+            edge_row = RoutedWriter(cfg, layer_index=lyr,
+                                    name=f"writer_{lyr}")(source_message)
+          else:
+            edge_row = jnp.ones((B, L, C, _writer_target_count(cfg)),
+                                dtype=cfg.dtype)
+          self._sow_writer_metrics(edge_row, lyr)
+          current_gate, identity_gate = self._path_gates(edge_row, lyr)
+          if cfg.rdm_block_style == "dca":
+            h_next = current_gate.astype(raw_next.dtype) * raw_next
+          else:
+            h_next = _gate_transformer_output(
+                raw_next, xr, current_gate, identity_gate)
+          delta = h_next if cfg.rdm_block_style == "dca" else h_next - h
+          source_message = self._source_message(h, h_next, delta, lyr)
+
       if lyr + 1 < cfg.N:
-        messages.append(self._source_message(h_next, h, delta, lyr))
-        edge_rows = self._append_writer_row(edge_rows, h_next, delta, lyr,
-                                            B, L, C)
+        messages.append(source_message)
+        edge_rows = self._append_writer_row(edge_rows, source_message, lyr,
+                                            B, L, C, edge_row=edge_row)
       h = h_next
     return h
 
@@ -1049,6 +1198,26 @@ class RdmTransformerDo(nn.Module):
       else:
         self._sow_target_edge_metrics(jnp.ones((B, L, 1, C), dtype=cfg.dtype))
 
+      source_base = _source_state_base(cfg)
+      preblock_writer = (
+          cfg.rdm_include_identity_path and source_base in ("raw_cur", "hidden"))
+      edge_row = None
+      current_gate = jnp.ones((B, L, 1), dtype=cfg.dtype)
+      identity_gate = jnp.ones((B, L, 1), dtype=cfg.dtype)
+      source_message = None
+      route_hidden = streams.mean(axis=2)
+      if preblock_writer:
+        source_message = self._source_message(prev_hidden, route_hidden, None, lyr)
+        if cfg.rdm_writer_enabled:
+          edge_row = RoutedWriter(cfg, layer_index=lyr,
+                                  name=f"writer_{lyr}")(source_message)
+        else:
+          edge_row = jnp.ones((B, L, C, _writer_target_count(cfg)),
+                              dtype=cfg.dtype)
+        self._sow_writer_metrics(edge_row, lyr)
+        current_gate, identity_gate = self._path_gates(edge_row, lyr)
+
+      base_streams = streams
       h_pre, h_post, h_res = MHCMappings(cfg, name=f"map_attn_{lyr}")(streams)
       agg = _mhc_aggregate(streams, h_pre)
       attn = MultiInputRoPECausalAttn(cfg, name=f"attn_{lyr}")(
@@ -1068,10 +1237,31 @@ class RdmTransformerDo(nn.Module):
       h_next = streams.mean(axis=2)
       delta = h_next - prev_hidden
 
+      if cfg.rdm_include_identity_path:
+        if not preblock_writer:
+          source_message = self._source_message(prev_hidden, h_next, delta, lyr)
+          if cfg.rdm_writer_enabled:
+            edge_row = RoutedWriter(cfg, layer_index=lyr,
+                                    name=f"writer_{lyr}")(source_message)
+          else:
+            edge_row = jnp.ones((B, L, C, _writer_target_count(cfg)),
+                                dtype=cfg.dtype)
+          self._sow_writer_metrics(edge_row, lyr)
+          current_gate, identity_gate = self._path_gates(edge_row, lyr)
+        gate_c = current_gate[:, :, None, :].astype(streams.dtype)
+        gate_i = identity_gate[:, :, None, :].astype(streams.dtype)
+        streams = gate_i * base_streams + gate_c * (streams - base_streams)
+        h_next = streams.mean(axis=2)
+        delta = h_next - prev_hidden
+        if not preblock_writer:
+          source_message = self._source_message(prev_hidden, h_next, delta, lyr)
+      elif source_message is None:
+        source_message = self._source_message(prev_hidden, h_next, delta, lyr)
+
       if lyr + 1 < cfg.N:
-        messages.append(self._source_message(h_next, prev_hidden, delta, lyr))
-        edge_rows = self._append_writer_row(edge_rows, h_next, delta, lyr,
-                                            B, L, C)
+        messages.append(source_message)
+        edge_rows = self._append_writer_row(edge_rows, source_message, lyr,
+                                            B, L, C, edge_row=edge_row)
     return streams.mean(axis=2)
 
   def _call_attnres(self, h, positions, B, L, C):
@@ -1100,14 +1290,53 @@ class RdmTransformerDo(nn.Module):
       xq, xk, xv, xr = self._call_depth_reader(lyr, stack, edges, "attnres")
       if xr is None:
         xr = h
-      h_next = MultiInputBlock(cfg, name=f"block_{lyr}")(
+      route_hidden = xq if cfg.rdm_mix_mode in ("hidden", "qkv") else xr
+      source_base = _source_state_base(cfg)
+      preblock_writer = (
+          cfg.rdm_include_identity_path and source_base in ("raw_cur", "hidden"))
+      edge_row = None
+      current_gate = jnp.ones((B, L, 1), dtype=cfg.dtype)
+      identity_gate = jnp.ones((B, L, 1), dtype=cfg.dtype)
+      source_message = None
+      if preblock_writer:
+        source_message = self._source_message(h, route_hidden, None, lyr)
+        if cfg.rdm_writer_enabled:
+          edge_row = RoutedWriter(cfg, layer_index=lyr,
+                                  name=f"writer_{lyr}")(source_message)
+        else:
+          edge_row = jnp.ones((B, L, C, _writer_target_count(cfg)),
+                              dtype=cfg.dtype)
+        self._sow_writer_metrics(edge_row, lyr)
+        current_gate, identity_gate = self._path_gates(edge_row, lyr)
+
+      raw_next = MultiInputBlock(cfg, name=f"block_{lyr}")(
           xq, xk, xv, xr, positions, current=h)
+      h_next = (
+          _gate_transformer_output(raw_next, xr, current_gate, identity_gate)
+          if cfg.rdm_include_identity_path else raw_next
+      )
       delta = h_next - h
 
+      if not preblock_writer:
+        source_message = self._source_message(h, h_next, delta, lyr)
+        if cfg.rdm_include_identity_path:
+          if cfg.rdm_writer_enabled:
+            edge_row = RoutedWriter(cfg, layer_index=lyr,
+                                    name=f"writer_{lyr}")(source_message)
+          else:
+            edge_row = jnp.ones((B, L, C, _writer_target_count(cfg)),
+                                dtype=cfg.dtype)
+          self._sow_writer_metrics(edge_row, lyr)
+          current_gate, identity_gate = self._path_gates(edge_row, lyr)
+          h_next = _gate_transformer_output(
+              raw_next, xr, current_gate, identity_gate)
+          delta = h_next - h
+          source_message = self._source_message(h, h_next, delta, lyr)
+
       if lyr + 1 < cfg.N:
-        messages.append(self._source_message(h_next, h, delta, lyr))
-        edge_rows = self._append_writer_row(edge_rows, h_next, delta, lyr,
-                                            B, L, C)
+        messages.append(source_message)
+        edge_rows = self._append_writer_row(edge_rows, source_message, lyr,
+                                            B, L, C, edge_row=edge_row)
       h = h_next
     return h
 
